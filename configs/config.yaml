@@ -1,0 +1,76 @@
+# FinOps Cost Aggregator Configuration
+
+aws:
+  enabled: true
+  role_arn: ${AWS_ROLE_ARN}
+  region: us-east-1
+  account_ids:
+    - "123456789012"
+    - "234567890123"
+  granularity: DAILY
+  group_by:
+    - SERVICE
+    - LINKED_ACCOUNT
+
+azure:
+  enabled: true
+  tenant_id: ${AZURE_TENANT_ID}
+  subscription_ids:
+    - "subscription-id-1"
+    - "subscription-id-2"
+  use_msi: true
+  granularity: DAILY
+
+gcp:
+  enabled: true
+  billing_account: ${GCP_BILLING_ACCOUNT}
+  project_id: ${GCP_PROJECT_ID}
+  wif_config_path: ${GCP_WIF_CONFIG_PATH}
+
+budgets:
+  - name: "AWS Monthly"
+    provider: aws
+    monthly_limit: 10000
+    alert_at: [50, 75, 90, 100]
+    notify_emails:
+      - finops@company.com
+    notify_slack: "#finops-alerts"
+
+  - name: "Azure Monthly"
+    provider: azure
+    monthly_limit: 8000
+    alert_at: [50, 75, 90, 100]
+    notify_emails:
+      - finops@company.com
+
+  - name: "Total Cloud"
+    provider: all
+    monthly_limit: 25000
+    alert_at: [75, 90, 100]
+    notify_emails:
+      - leadership@company.com
+      - finops@company.com
+
+anomaly:
+  enabled: true
+  lookback_days: 30
+  deviation_threshold: 25  # Alert if 25% above average
+  minimum_cost_threshold: 100  # Ignore services below $100
+
+alerting:
+  email:
+    enabled: true
+    use_ms_graph: true
+    ms_tenant_id: ${MS_TENANT_ID}
+    ms_client_id: ${MS_CLIENT_ID}
+    recipients:
+      - finops@company.com
+  
+  slack:
+    enabled: true
+    webhook_url: ${SLACK_WEBHOOK_URL}
+    channel: "#finops-alerts"
+
+reporter:
+  output_dir: ./reports
+

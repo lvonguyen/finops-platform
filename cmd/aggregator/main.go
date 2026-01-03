@@ -1,4 +1,4 @@
-// Package main provides the FinOps cost aggregation CLI.
+// Package main provides the entrypoint for the FinOps Cost Aggregator
 package main
 
 import (
@@ -8,267 +8,205 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
-	"go.uber.org/zap"
-
-	"github.com/lvonguyen/finops-platform/internal/anomaly"
-	"github.com/lvonguyen/finops-platform/internal/chargeback"
-	"github.com/lvonguyen/finops-platform/internal/normalizer"
-	"github.com/lvonguyen/finops-platform/internal/providers"
+	"github.com/lvonguyen/finops-platform/internal/aggregator"
+	"github.com/lvonguyen/finops-platform/internal/config"
+	"github.com/lvonguyen/finops-platform/internal/providers/aws"
+	"github.com/lvonguyen/finops-platform/internal/providers/azure"
+	"github.com/lvonguyen/finops-platform/internal/providers/gcp"
+	"github.com/lvonguyen/finops-platform/internal/reporter"
 )
 
-// Config holds application configuration
-type Config struct {
-	Mode       string // aggregate, chargeback, anomaly, forecast, budget
-	ConfigPath string
-	Month      string // YYYY-MM for chargeback
-	Days       int    // Days for anomaly detection
-	OutputDir  string
-	Verbose    bool
-}
-
 func main() {
-	cfg := parseFlags()
+	// Parse command-line flags
+	configPath := flag.String("config", "configs/config.yaml", "Path to configuration file")
+	dryRun := flag.Bool("dry-run", false, "Dry run mode - don't send alerts")
+	cloud := flag.String("cloud", "all", "Cloud provider to query: aws, azure, gcp, or all")
+	startDate := flag.String("start", "", "Start date (YYYY-MM-DD), defaults to first of current month")
+	endDate := flag.String("end", "", "End date (YYYY-MM-DD), defaults to today")
+	outputFormat := flag.String("format", "html", "Output format: html, csv, json")
+	flag.Parse()
 
-	// Initialize logger
-	var logger *zap.Logger
-	var err error
-	if cfg.Verbose {
-		logger, err = zap.NewDevelopment()
-	} else {
-		logger, err = zap.NewProduction()
-	}
+	// Load configuration
+	cfg, err := config.Load(*configPath)
 	if err != nil {
-		log.Fatalf("Failed to initialize logger: %v", err)
+		log.Fatalf("Failed to load configuration: %v", err)
 	}
-	defer logger.Sync()
 
-	logger.Info("Starting FinOps Cost Aggregator",
-		zap.String("mode", cfg.Mode),
-		zap.String("config", cfg.ConfigPath),
-	)
+	// Parse dates
+	start, end := parseDates(*startDate, *endDate)
 
 	// Setup context with cancellation
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	// Handle shutdown signals
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
-		<-sigChan
-		logger.Info("Received shutdown signal")
+		<-sigCh
+		log.Println("Received shutdown signal, cancelling...")
 		cancel()
 	}()
 
-	// Execute based on mode
-	var execErr error
-	switch cfg.Mode {
-	case "aggregate":
-		execErr = runAggregate(ctx, cfg, logger)
-	case "chargeback":
-		execErr = runChargeback(ctx, cfg, logger)
-	case "anomaly":
-		execErr = runAnomaly(ctx, cfg, logger)
-	case "forecast":
-		execErr = runForecast(ctx, cfg, logger)
-	case "budget":
-		execErr = runBudgetCheck(ctx, cfg, logger)
-	default:
-		logger.Fatal("Unknown mode", zap.String("mode", cfg.Mode))
-	}
+	// Initialize aggregator
+	agg := aggregator.New(cfg)
 
-	if execErr != nil {
-		logger.Error("Execution failed", zap.Error(execErr))
-		os.Exit(1)
-	}
-
-	logger.Info("FinOps Cost Aggregator complete")
-}
-
-func parseFlags() *Config {
-	cfg := &Config{}
-
-	flag.StringVar(&cfg.Mode, "mode", "aggregate", "Mode: aggregate, chargeback, anomaly, forecast, budget")
-	flag.StringVar(&cfg.ConfigPath, "config", "configs/config.yaml", "Path to config file")
-	flag.StringVar(&cfg.Month, "month", "", "Month for chargeback (YYYY-MM)")
-	flag.IntVar(&cfg.Days, "days", 7, "Days for anomaly detection")
-	flag.StringVar(&cfg.OutputDir, "output", "reports", "Output directory for reports")
-	flag.BoolVar(&cfg.Verbose, "verbose", false, "Enable verbose logging")
-	flag.Parse()
-
-	return cfg
-}
-
-// runAggregate aggregates costs from all cloud providers
-func runAggregate(ctx context.Context, cfg *Config, logger *zap.Logger) error {
-	logger.Info("Running cost aggregation")
-
-	// Initialize providers
-	costProviders := []providers.CostProvider{}
-
-	// AWS Cost Explorer
-	if os.Getenv("AWS_REGION") != "" || os.Getenv("AWS_PROFILE") != "" {
-		aws, err := providers.NewAWSCostExplorer(ctx, providers.AWSConfig{
-			Region:      os.Getenv("AWS_REGION"),
-			Granularity: "DAILY",
-		})
+	// Register cloud providers
+	if *cloud == "all" || *cloud == "aws" {
+		awsProvider, err := aws.NewCostProvider(ctx, cfg.AWS)
 		if err != nil {
-			logger.Warn("Failed to initialize AWS provider", zap.Error(err))
+			log.Printf("Warning: Failed to initialize AWS provider: %v", err)
 		} else {
-			costProviders = append(costProviders, aws)
+			agg.RegisterProvider("aws", awsProvider)
 		}
 	}
 
-	// Azure Cost Management
-	if os.Getenv("AZURE_SUBSCRIPTION_ID") != "" {
-		azure, err := providers.NewAzureCostManagement(ctx, providers.AzureConfig{
-			SubscriptionID: os.Getenv("AZURE_SUBSCRIPTION_ID"),
-		})
+	if *cloud == "all" || *cloud == "azure" {
+		azureProvider, err := azure.NewCostProvider(ctx, cfg.Azure)
 		if err != nil {
-			logger.Warn("Failed to initialize Azure provider", zap.Error(err))
+			log.Printf("Warning: Failed to initialize Azure provider: %v", err)
 		} else {
-			costProviders = append(costProviders, azure)
+			agg.RegisterProvider("azure", azureProvider)
 		}
 	}
 
-	// GCP Billing
-	if os.Getenv("GCP_PROJECT_ID") != "" {
-		gcp, err := providers.NewGCPBilling(ctx, providers.GCPConfig{
-			ProjectID: os.Getenv("GCP_PROJECT_ID"),
-			Dataset:   os.Getenv("GCP_BILLING_DATASET"),
-		})
+	if *cloud == "all" || *cloud == "gcp" {
+		gcpProvider, err := gcp.NewCostProvider(ctx, cfg.GCP)
 		if err != nil {
-			logger.Warn("Failed to initialize GCP provider", zap.Error(err))
+			log.Printf("Warning: Failed to initialize GCP provider: %v", err)
 		} else {
-			costProviders = append(costProviders, gcp)
+			agg.RegisterProvider("gcp", gcpProvider)
 		}
-	}
-
-	if len(costProviders) == 0 {
-		return fmt.Errorf("no cost providers configured")
 	}
 
 	// Aggregate costs
-	endDate := time.Now()
-	startDate := endDate.AddDate(0, 0, -30) // Last 30 days
-
-	var allCosts []normalizer.CostRecord
-	for _, provider := range costProviders {
-		costs, err := provider.GetCosts(ctx, startDate, endDate)
-		if err != nil {
-			logger.Error("Failed to get costs", zap.String("provider", provider.Name()), zap.Error(err))
-			continue
-		}
-		allCosts = append(allCosts, costs...)
-		logger.Info("Costs retrieved", zap.String("provider", provider.Name()), zap.Int("records", len(costs)))
-	}
-
-	// Normalize and summarize
-	summary := normalizer.Summarize(allCosts)
-	printSummary(summary)
-
-	return nil
-}
-
-// runChargeback generates chargeback reports
-func runChargeback(ctx context.Context, cfg *Config, logger *zap.Logger) error {
-	logger.Info("Generating chargeback report", zap.String("month", cfg.Month))
-
-	// Parse month
-	month := cfg.Month
-	if month == "" {
-		month = time.Now().Format("2006-01")
-	}
-
-	// Initialize allocator
-	allocator := chargeback.NewAllocator(chargeback.AllocatorConfig{
-		PrimaryTag:    "cost_center",
-		FallbackTag:   "team",
-		UntaggedPool:  "IT-SHARED",
-	})
-
-	// Get costs for month (stub)
-	costs := []normalizer.CostRecord{} // Would fetch from providers
-
-	// Allocate costs
-	allocations := allocator.Allocate(costs)
-
-	// Generate report
-	report := chargeback.GenerateReport(allocations, month)
+	log.Printf("Aggregating costs from %s to %s", start.Format("2006-01-02"), end.Format("2006-01-02"))
 	
-	// Save report
-	outputPath := fmt.Sprintf("%s/chargeback-%s.csv", cfg.OutputDir, month)
-	if err := report.SaveCSV(outputPath); err != nil {
-		return fmt.Errorf("failed to save report: %w", err)
+	results, err := agg.Aggregate(ctx, start, end)
+	if err != nil {
+		log.Fatalf("Failed to aggregate costs: %v", err)
 	}
 
-	logger.Info("Chargeback report generated", zap.String("path", outputPath))
-	return nil
-}
-
-// runAnomaly runs anomaly detection
-func runAnomaly(ctx context.Context, cfg *Config, logger *zap.Logger) error {
-	logger.Info("Running anomaly detection", zap.Int("days", cfg.Days))
-
-	detector := anomaly.NewDetector(anomaly.DetectorConfig{
-		Sensitivity:  anomaly.SensitivityMedium,
-		BaselineDays: 30,
-		MinSpend:     100.0,
-	})
-
-	// Get recent costs (stub)
-	costs := []normalizer.CostRecord{}
+	log.Printf("Retrieved %d cost entries across %d providers", len(results.Entries), len(results.ByProvider))
 
 	// Detect anomalies
-	anomalies := detector.Detect(costs)
-
-	if len(anomalies) == 0 {
-		logger.Info("No anomalies detected")
-		return nil
+	anomalies := agg.DetectAnomalies(results)
+	if len(anomalies) > 0 {
+		log.Printf("Detected %d cost anomalies", len(anomalies))
 	}
 
-	logger.Warn("Anomalies detected", zap.Int("count", len(anomalies)))
-	for _, a := range anomalies {
-		fmt.Printf("  - %s: %s (%.1f%% change)\n", a.Service, a.Reason, a.PercentChange)
+	// Check budgets
+	budgetAlerts := agg.CheckBudgets(results)
+	if len(budgetAlerts) > 0 {
+		log.Printf("Detected %d budget alerts", len(budgetAlerts))
 	}
 
-	return nil
-}
-
-// runForecast generates spend forecasts
-func runForecast(ctx context.Context, cfg *Config, logger *zap.Logger) error {
-	logger.Info("Generating spend forecast")
-	// Implementation would use time-series forecasting
-	fmt.Println("Forecast generation not yet implemented")
-	return nil
-}
-
-// runBudgetCheck checks budget status
-func runBudgetCheck(ctx context.Context, cfg *Config, logger *zap.Logger) error {
-	logger.Info("Checking budget status")
-	// Implementation would check against configured budgets
-	fmt.Println("Budget check not yet implemented")
-	return nil
-}
-
-// printSummary prints the cost summary
-func printSummary(summary normalizer.CostSummary) {
-	fmt.Println()
-	fmt.Println("╔══════════════════════════════════════════════════════════════════╗")
-	fmt.Println("║                Multi-Cloud Cost Summary                          ║")
-	fmt.Println("╠══════════════════════════════════════════════════════════════════╣")
-	fmt.Printf("║  Total Spend: $%.2f                                        \n", summary.TotalCost)
-	fmt.Printf("║  Period: %s to %s                             \n", summary.StartDate.Format("2006-01-02"), summary.EndDate.Format("2006-01-02"))
-	fmt.Println("║")
-	fmt.Println("║  By Cloud:")
-	for cloud, cost := range summary.ByCloud {
-		pct := (cost / summary.TotalCost) * 100
-		fmt.Printf("║    %-8s $%.2f (%.1f%%)\n", cloud+":", cost, pct)
+	// Generate report
+	rep := reporter.New(cfg.Reporter)
+	
+	reportData := reporter.ReportData{
+		Period:       fmt.Sprintf("%s to %s", start.Format("2006-01-02"), end.Format("2006-01-02")),
+		Results:      results,
+		Anomalies:    anomalies,
+		BudgetAlerts: budgetAlerts,
+		GeneratedAt:  time.Now(),
 	}
-	fmt.Println("╚══════════════════════════════════════════════════════════════════╝")
-	fmt.Println()
+
+	var outputPath string
+	switch *outputFormat {
+	case "html":
+		outputPath, err = rep.GenerateHTML(reportData)
+	case "csv":
+		outputPath, err = rep.GenerateCSV(reportData)
+	case "json":
+		outputPath, err = rep.GenerateJSON(reportData)
+	default:
+		log.Fatalf("Unknown output format: %s", *outputFormat)
+	}
+
+	if err != nil {
+		log.Fatalf("Failed to generate report: %v", err)
+	}
+
+	log.Printf("Report generated: %s", outputPath)
+
+	// Send alerts (unless dry-run)
+	if !*dryRun && (len(anomalies) > 0 || len(budgetAlerts) > 0) {
+		if err := agg.SendAlerts(ctx, anomalies, budgetAlerts); err != nil {
+			log.Printf("Warning: Failed to send some alerts: %v", err)
+		}
+	}
+
+	// Print summary
+	printSummary(results, anomalies, budgetAlerts)
+}
+
+func parseDates(startStr, endStr string) (time.Time, time.Time) {
+	now := time.Now()
+	
+	var start, end time.Time
+	var err error
+
+	if startStr == "" {
+		// Default to first of current month
+		start = time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, time.UTC)
+	} else {
+		start, err = time.Parse("2006-01-02", startStr)
+		if err != nil {
+			log.Fatalf("Invalid start date format: %v", err)
+		}
+	}
+
+	if endStr == "" {
+		// Default to today
+		end = time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC)
+	} else {
+		end, err = time.Parse("2006-01-02", endStr)
+		if err != nil {
+			log.Fatalf("Invalid end date format: %v", err)
+		}
+	}
+
+	return start, end
+}
+
+func printSummary(results *aggregator.AggregationResult, anomalies []aggregator.Anomaly, budgetAlerts []aggregator.BudgetAlert) {
+	separator := strings.Repeat("=", 60)
+	fmt.Println("\n" + separator)
+	fmt.Println("COST AGGREGATION SUMMARY")
+	fmt.Println(separator)
+
+	fmt.Printf("\nTotal Cost: $%.2f\n", results.TotalCost)
+	fmt.Println("\nBy Provider:")
+	for provider, cost := range results.ByProvider {
+		fmt.Printf("  %-10s: $%.2f\n", provider, cost)
+	}
+
+	fmt.Println("\nTop 5 Services:")
+	for i, entry := range results.TopServices(5) {
+		fmt.Printf("  %d. %-30s: $%.2f\n", i+1, entry.Service, entry.Cost)
+	}
+
+	if len(anomalies) > 0 {
+		fmt.Printf("\nAnomalies Detected: %d\n", len(anomalies))
+		for _, a := range anomalies {
+			fmt.Printf("  - %s: %.1f%% above expected ($%.2f vs $%.2f expected)\n",
+				a.Service, a.PercentageDeviation, a.ActualCost, a.ExpectedCost)
+		}
+	}
+
+	if len(budgetAlerts) > 0 {
+		fmt.Printf("\nBudget Alerts: %d\n", len(budgetAlerts))
+		for _, b := range budgetAlerts {
+			fmt.Printf("  - %s: $%.2f / $%.2f (%.1f%%)\n",
+				b.BudgetName, b.CurrentSpend, b.BudgetLimit, b.PercentUsed)
+		}
+	}
+
+	fmt.Println("\n" + separator)
 }
 

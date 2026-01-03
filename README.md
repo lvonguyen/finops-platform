@@ -102,21 +102,26 @@ finops-platform/
 │   └── aggregator/
 │       └── main.go              # CLI entrypoint
 ├── internal/
+│   ├── aggregator/
+│   │   └── aggregator.go        # Core aggregation engine
+│   ├── config/
+│   │   └── config.go            # Configuration management
 │   ├── providers/
-│   │   ├── aws.go               # AWS Cost Explorer client
-│   │   ├── azure.go             # Azure Cost Management client
-│   │   └── gcp.go               # GCP BigQuery Billing client
+│   │   ├── aws/
+│   │   │   └── cost.go          # AWS Cost Explorer client
+│   │   ├── azure/
+│   │   │   └── cost.go          # Azure Cost Management client
+│   │   └── gcp/
+│   │       └── cost.go          # GCP BigQuery Billing client
 │   ├── normalizer/
 │   │   └── schema.go            # Common cost schema
 │   ├── anomaly/
-│   │   ├── detector.go          # Anomaly detection logic
-│   │   └── forecaster.go        # Spend forecasting
+│   │   └── detector.go          # Statistical anomaly detection
 │   ├── chargeback/
-│   │   ├── allocator.go         # Cost allocation engine
-│   │   └── reports.go           # Report generation
-│   └── alerts/
-│       ├── budget.go            # Budget alerting
-│       └── slack.go             # Slack integration
+│   │   └── allocator.go         # Cost allocation engine
+│   ├── reporter/
+│   │   └── reporter.go          # HTML/CSV report generation
+│   └── alerts/                  # Alerting integrations
 ├── configs/
 │   └── config.yaml              # Configuration template
 ├── reports/                     # Generated reports
